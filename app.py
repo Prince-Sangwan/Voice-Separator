@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -11,7 +14,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
-from sklearn.decomposition import FastICA
+from speechbrain.utils.fetching import LocalStrategy
 from transformers import pipeline
 
 
@@ -26,67 +29,71 @@ class AudioSeparator(Protocol):
         ...
 
 
-class FastICASeparator:
-    def __init__(self, target_sample_rate: int = 16000, n_components: int = 2) -> None:
+class SepFormerSeparator:
+    """Uses SpeechBrain's pre-trained SepFormer model for real speech separation."""
+
+    def __init__(self, target_sample_rate: int = 8000) -> None:
         self.target_sample_rate = target_sample_rate
-        self.n_components = n_components
+        self._model = None
+        self._lock = Lock()
+
+    def _get_model(self):
+        if self._model is None:
+            with self._lock:
+                if self._model is None:
+                    from speechbrain.inference.separation import SepformerSeparation
+                    self._model = SepformerSeparation.from_hparams(
+                        source="speechbrain/sepformer-wsj02mix",
+                        savedir=Path(tempfile.gettempdir()) / "sepformer_model",
+                        local_strategy=LocalStrategy.COPY,
+                    )
+        return self._model
 
     def separate(self, audio_path: str | Path) -> SeparationResult:
-        waveform = self._load_audio(audio_path)
-        observations = self._build_observation_matrix(waveform)
-        separated_sources = self._run_ica(observations)
-        stream_paths = self._write_streams(separated_sources)
-        return SeparationResult(sample_rate=self.target_sample_rate, stream_paths=stream_paths)
+        # Load and resample to 8kHz (what the model expects)
+        waveform, orig_sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+        if waveform.ndim == 2:
+            waveform = np.mean(waveform, axis=1, dtype=np.float32)
 
-    def _load_audio(self, audio_path: str | Path) -> np.ndarray:
-        waveform, _ = librosa.load(str(audio_path), sr=self.target_sample_rate, mono=False)
-        return np.asarray(waveform, dtype=np.float32)
+        # Resample to 8kHz for the model
+        if orig_sr != self.target_sample_rate:
+            waveform = librosa.resample(
+                waveform, orig_sr=orig_sr, target_sr=self.target_sample_rate
+            )
 
-    def _build_observation_matrix(self, waveform: np.ndarray) -> np.ndarray:
-        if waveform.ndim == 1:
-            return self._build_mono_observation_matrix(waveform)
-        channels = np.atleast_2d(waveform)
-        if channels.shape[0] < self.n_components:
-            return self._build_mono_observation_matrix(channels[0])
-        return channels[: self.n_components].T.astype(np.float32)
+        # Convert to torch tensor [batch, time]
+        mix_tensor = torch.from_numpy(waveform).unsqueeze(0).float()
 
-    def _build_mono_observation_matrix(self, waveform: np.ndarray) -> np.ndarray:
-        if waveform.size < self.n_components * 8:
-            raise ValueError("The uploaded audio is too short to separate.")
-        normalized = librosa.util.normalize(waveform)
-        delayed = np.roll(normalized, 1)
-        delayed[0] = 0.0
-        emphasized = librosa.effects.preemphasis(normalized)
-        observations = np.column_stack((normalized, 0.6 * delayed + 0.4 * emphasized))
-        return observations.astype(np.float32)
+        # Run separation
+        model = self._get_model()
+        est_sources = model.separate_batch(mix_tensor)
+        # est_sources shape: [batch, time, n_speakers]
 
-    def _run_ica(self, observations: np.ndarray) -> np.ndarray:
-        estimator = FastICA(
-            n_components=self.n_components,
-            whiten="unit-variance",
-            max_iter=2000,
-            tol=1e-4,
-            random_state=0,
-        )
-        sources = estimator.fit_transform(observations)
-        return sources.T.astype(np.float32)
+        # Extract separated sources
+        source1 = est_sources[0, :, 0].cpu().numpy()
+        source2 = est_sources[0, :, 1].cpu().numpy()
 
-    def _write_streams(self, sources: np.ndarray) -> tuple[str, str]:
-        if sources.shape[0] != self.n_components:
-            raise ValueError("The separator did not produce two output streams.")
+        # Normalize
+        source1 = self._normalize_audio(source1)
+        source2 = self._normalize_audio(source2)
+
+        # Write output files
         temp_dir = Path(tempfile.mkdtemp(prefix="voice_separator_"))
-        output_paths: list[str] = []
-        for index, source in enumerate(sources, start=1):
-            output_path = temp_dir / f"speaker_{index}.wav"
-            sf.write(str(output_path), self._normalize_audio(source), self.target_sample_rate)
-            output_paths.append(str(output_path))
-        return output_paths[0], output_paths[1]
+        path1 = temp_dir / "speaker_1.wav"
+        path2 = temp_dir / "speaker_2.wav"
+        sf.write(str(path1), source1, self.target_sample_rate)
+        sf.write(str(path2), source2, self.target_sample_rate)
+
+        return SeparationResult(
+            sample_rate=self.target_sample_rate,
+            stream_paths=(str(path1), str(path2)),
+        )
 
     def _normalize_audio(self, source: np.ndarray) -> np.ndarray:
         peak = float(np.max(np.abs(source))) if source.size else 0.0
         if peak == 0.0:
             return source.astype(np.float32)
-        return (source / peak).astype(np.float32)
+        return (source / peak * 0.95).astype(np.float32)
 
 
 class WhisperSmallTranscriber:
@@ -122,7 +129,7 @@ class WhisperSmallTranscriber:
         return self._pipeline
 
 
-SEPARATOR: AudioSeparator = FastICASeparator()
+SEPARATOR: AudioSeparator = SepFormerSeparator()
 TRANSCRIBER = WhisperSmallTranscriber()
 
 CUSTOM_CSS = """
@@ -1004,7 +1011,7 @@ with gr.Blocks(title="Overlapping Voice Separator and Transcriber", fill_width=T
             """
             <div class="privacy-note">
                 <span><strong>Private by design.</strong> Separation and transcription run locally on your machine.</span>
-                <span>FastICA plus Whisper Small</span>
+                <span>SepFormer plus Whisper Small</span>
             </div>
             """
         )
